@@ -1,0 +1,245 @@
+name: Build Tailscale for Windows 7
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/tailscale-win7-build.yml']
+  workflow_dispatch:
+    inputs:
+      tailscale_version:
+        description: 'Tailscale tag to build'
+        required: true
+        default: 'v1.80.2'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-win7:
+    name: Win7 ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, '386']
+    env:
+      TS_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tailscale_version || 'v1.80.2' }}
+
+    steps:
+      - name: Checkout Tailscale source
+        uses: actions/checkout@v4
+        with:
+          repository: tailscale/tailscale
+          ref: ${{ env.TS_VERSION }}
+          path: tailscale-src
+          fetch-depth: 1
+
+      - name: Install Go legacy Win7 toolchain
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          api='https://api.github.com/repos/thongtech/go-legacy-win7/releases?per_page=100'
+          asset_url="$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' "$api" |
+            jq -r '[.[].assets[] | select(.name | test("^go-legacy-win7-1\\.24\\.[0-9]+-[0-9]+\\.linux_amd64\\.tar\\.gz$"))] | sort_by(.created_at) | reverse | .[0].browser_download_url // empty')"
+          test -n "$asset_url" || { echo 'No Go 1.24.x legacy Win7 toolchain found'; exit 1; }
+          echo "Legacy Go asset: $asset_url"
+          mkdir -p "$RUNNER_TEMP/go-legacy"
+          curl -fL --retry 3 "$asset_url" -o "$RUNNER_TEMP/go-legacy.tar.gz"
+          tar -xzf "$RUNNER_TEMP/go-legacy.tar.gz" -C "$RUNNER_TEMP/go-legacy"
+          go_bin="$(find "$RUNNER_TEMP/go-legacy" -type f -path '*/bin/go' | head -n 1)"
+          test -n "$go_bin"
+          goroot="$(dirname "$(dirname "$go_bin")")"
+          echo "GOROOT=$goroot" >> "$GITHUB_ENV"
+          echo "$goroot/bin" >> "$GITHUB_PATH"
+
+      - name: Verify toolchain
+        shell: bash
+        run: go version
+
+      - name: Build tailscale.exe and tailscaled.exe
+        shell: bash
+        env:
+          GOOS: windows
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          cd tailscale-src
+          mkdir -p "../dist-${GOARCH}"
+          go mod download
+          go build -trimpath -o "../dist-${GOARCH}/tailscale.exe" ./cmd/tailscale
+          go build -trimpath -o "../dist-${GOARCH}/tailscaled.exe" ./cmd/tailscaled
+          file "../dist-${GOARCH}/tailscale.exe" "../dist-${GOARCH}/tailscaled.exe"
+
+      - name: Add Wintun 0.14.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 'https://www.wintun.net/builds/wintun-0.14.1.zip' -o "$RUNNER_TEMP/wintun.zip"
+          unzip -q "$RUNNER_TEMP/wintun.zip" -d "$RUNNER_TEMP/wintun"
+          if [[ '${{ matrix.arch }}' == 'amd64' ]]; then wt_arch='amd64'; else wt_arch='x86'; fi
+          cp "$RUNNER_TEMP/wintun/wintun/bin/${wt_arch}/wintun.dll" "dist-${{ matrix.arch }}/wintun.dll"
+
+      - name: Add Win7 helper files
+        shell: bash
+        run: |
+          set -euo pipefail
+          out='dist-${{ matrix.arch }}'
+          cat > "$out/install-service.cmd" <<'CMD'
+          @echo off
+          chcp 65001 >nul
+          setlocal
+          cd /d "%~dp0"
+          net session >nul 2>&1
+          if errorlevel 1 (
+            echo [ERROR] Please right-click and Run as administrator.
+            pause
+            exit /b 1
+          )
+          if not exist tailscale.exe goto missing
+          if not exist tailscaled.exe goto missing
+          if not exist wintun.dll goto missing
+          sc stop Tailscale >nul 2>&1
+          tailscaled.exe uninstall-system-daemon >nul 2>&1
+          tailscaled.exe install-system-daemon
+          if errorlevel 1 goto failed
+          net start Tailscale
+          if errorlevel 1 goto failed
+          echo.
+          echo Tailscale service installed and started.
+          echo Official Tailscale: tailscale.exe up
+          echo Headscale: tailscale.exe up --login-server=https://YOUR-HEADSCALE-SERVER
+          pause
+          exit /b 0
+          :missing
+          echo [ERROR] tailscale.exe, tailscaled.exe and wintun.dll must be together.
+          pause
+          exit /b 1
+          :failed
+          echo [ERROR] Service install/start failed. Check C:\ProgramData\Tailscale\Logs and Event Viewer.
+          pause
+          exit /b 1
+          CMD
+
+          cat > "$out/uninstall-service.cmd" <<'CMD'
+          @echo off
+          chcp 65001 >nul
+          setlocal
+          cd /d "%~dp0"
+          net session >nul 2>&1
+          if errorlevel 1 (
+            echo [ERROR] Run as administrator.
+            pause
+            exit /b 1
+          )
+          net stop Tailscale >nul 2>&1
+          tailscaled.exe uninstall-system-daemon
+          pause
+          CMD
+
+          cat > "$out/check-win7.cmd" <<'CMD'
+          @echo off
+          chcp 65001 >nul
+          cd /d "%~dp0"
+          ver
+          wmic os get Caption,Version,OSArchitecture 2>nul
+          echo.
+          tailscale.exe version
+          tailscaled.exe --version
+          echo.
+          sc query Tailscale
+          echo.
+          tailscale.exe status
+          pause
+          CMD
+
+          cat > "$out/README-WIN7.txt" <<EOF
+          Tailscale ${TS_VERSION} custom build for Windows 7
+          ==================================================
+
+          Contents:
+          - tailscale.exe
+          - tailscaled.exe
+          - wintun.dll (official Wintun 0.14.1)
+          - install-service.cmd / uninstall-service.cmd
+          - check-win7.cmd
+          - SHA256SUMS.txt
+
+          Recommended build: v1.80.2. A public Tailscale issue reports v1.80.2
+          running normally on Windows 7 when compiled with a Go 1.24 legacy-Win7 toolchain.
+
+          tailscale-ipn.exe is not included because Tailscale's Windows tray GUI wrapper
+          is not open source.
+
+          Install:
+          1. Extract all files to C:\Tailscale-Win7
+          2. Right-click install-service.cmd -> Run as administrator
+          3. Elevated Command Prompt:
+               tailscale.exe up
+             or for Headscale:
+               tailscale.exe up --login-server=https://YOUR-HEADSCALE-SERVER
+          4. Verify:
+               tailscale.exe status
+               tailscale.exe netcheck
+
+          Windows 7 notes:
+          - SP1 is recommended.
+          - Tailscale's Win7 documentation mentions KB2921916.
+          - If Wintun driver signing fails, check SHA-2 support including KB4474419.
+          - Do not enable automatic self-update for this unsupported custom build.
+          EOF
+
+          (cd "$out" && sha256sum tailscale.exe tailscaled.exe wintun.dll > SHA256SUMS.txt)
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-win7-${{ env.TS_VERSION }}-${{ matrix.arch }}
+          path: dist-${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-release:
+    name: Publish downloadable ZIPs
+    runs-on: ubuntu-24.04
+    needs: build-win7
+    env:
+      TS_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.tailscale_version || 'v1.80.2' }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+
+      - name: Package ZIP files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          for arch in amd64 386; do
+            src="downloaded/tailscale-win7-${TS_VERSION}-${arch}"
+            test -d "$src"
+            (cd "$src" && zip -9 -r "$GITHUB_WORKSPACE/release-files/tailscale-win7-${TS_VERSION}-${arch}.zip" .)
+          done
+          sha256sum release-files/*.zip > release-files/SHA256SUMS-ZIP.txt
+          ls -lh release-files
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="tailscale-win7-${TS_VERSION}-custom"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" release-files/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" release-files/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --title "Tailscale ${TS_VERSION} for Windows 7" \
+              --notes "Unofficial Windows 7-compatible build of Tailscale ${TS_VERSION}, compiled from the official Tailscale source using go-legacy-win7. Includes amd64 and 386 builds plus Wintun and helper scripts. The Windows tray GUI is not included because it is not open source."
+          fi
